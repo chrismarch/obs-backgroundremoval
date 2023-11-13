@@ -19,6 +19,7 @@
 #endif
 
 #include <opencv2/imgproc.hpp>
+//#include <opencv2/ximgproc/edge_filter.hpp>
 
 #include <numeric>
 #include <memory>
@@ -28,6 +29,408 @@
 #include "plugin-macros.generated.h"
 #include "Model.h"
 
+/*
+ *  By downloading, copying, installing or using the software you agree to this license.
+ *  If you do not agree to this license, do not download, install,
+ *  copy or use the software.
+ *
+ *
+ *  License Agreement
+ *  For Open Source Computer Vision Library
+ *  (3 - clause BSD License)
+ *
+ *  Redistribution and use in source and binary forms, with or without modification,
+ *  are permitted provided that the following conditions are met :
+ *
+ *  * Redistributions of source code must retain the above copyright notice,
+ *  this list of conditions and the following disclaimer.
+ *
+ *  * Redistributions in binary form must reproduce the above copyright notice,
+ *  this list of conditions and the following disclaimer in the documentation
+ *  and / or other materials provided with the distribution.
+ *
+ *  * Neither the names of the copyright holders nor the names of the contributors
+ *  may be used to endorse or promote products derived from this software
+ *  without specific prior written permission.
+ *
+ *  This software is provided by the copyright holders and contributors "as is" and
+ *  any express or implied warranties, including, but not limited to, the implied
+ *  warranties of merchantability and fitness for a particular purpose are disclaimed.
+ *  In no event shall copyright holders or contributors be liable for any direct,
+ *  indirect, incidental, special, exemplary, or consequential damages
+ *  (including, but not limited to, procurement of substitute goods or services;
+ *  loss of use, data, or profits; or business interruption) however caused
+ *  and on any theory of liability, whether in contract, strict liability,
+ *  or tort(including negligence or otherwise) arising in any way out of
+ *  the use of this software, even if advised of the possibility of such damage.
+ */
+
+//#include "precomp.hpp"
+#include <climits>
+#include <iostream>
+using namespace std;
+
+#ifdef _MSC_VER
+#   pragma warning(disable: 4512)
+#endif
+
+namespace cv
+{
+namespace ximgproc
+{
+
+typedef Vec<float, 1> Vec1f;
+typedef Vec<uchar, 1> Vec1b;
+
+#ifndef SQR
+#define SQR(a) ((a)*(a))
+#endif
+
+void jointBilateralFilter_32f(Mat& joint, Mat& src, Mat& dst, int radius, double sigmaColor, double sigmaSpace, int borderType);
+
+void jointBilateralFilter_8u(Mat& joint, Mat& src, Mat& dst, int radius, double sigmaColor, double sigmaSpace, int borderType);
+
+template<typename JointVec, typename SrcVec>
+class JointBilateralFilter_32f : public ParallelLoopBody
+{
+    Mat &joint, &src;
+    Mat &dst;
+    int radius, maxk;
+    float scaleIndex;
+    int *spaceOfs;
+    float *spaceWeights, *expLUT;
+
+public:
+
+    JointBilateralFilter_32f(Mat& joint_, Mat& src_, Mat& dst_, int radius_,
+        int maxk_, float scaleIndex_, int *spaceOfs_, float *spaceWeights_, float *expLUT_)
+        :
+        joint(joint_), src(src_), dst(dst_), radius(radius_), maxk(maxk_),
+        scaleIndex(scaleIndex_), spaceOfs(spaceOfs_), spaceWeights(spaceWeights_), expLUT(expLUT_)
+    {
+        CV_DbgAssert(joint.type() == traits::Type<JointVec>::value && src.type() == dst.type() && src.type() == traits::Type<SrcVec>::value);
+        CV_DbgAssert(joint.rows == src.rows && src.rows == dst.rows + 2*radius);
+        CV_DbgAssert(joint.cols == src.cols && src.cols == dst.cols + 2*radius);
+    }
+
+    void operator () (const Range& range) const CV_OVERRIDE
+    {
+        for (int i = radius + range.start; i < radius + range.end; i++)
+        {
+            for (int j = radius; j < src.cols - radius; j++)
+            {
+                JointVec *jointCenterPixPtr = joint.ptr<JointVec>(i) + j;
+                SrcVec *srcCenterPixPtr = src.ptr<SrcVec>(i) + j;
+
+                JointVec jointPix0 = *jointCenterPixPtr;
+                SrcVec srcSum = SrcVec::all(0.0f);
+                float wSum = 0.0f;
+
+                for (int k = 0; k < maxk; k++)
+                {
+                    float *jointPix = reinterpret_cast<float*>(jointCenterPixPtr + spaceOfs[k]);
+                    float alpha = 0.0f;
+
+                    for (int cn = 0; cn < JointVec::channels; cn++)
+                        alpha += std::abs(jointPix0[cn] - jointPix[cn]);
+                    alpha *= scaleIndex;
+                    int idx = (int)(alpha);
+                    alpha -= idx;
+                    float weight = spaceWeights[k] * (expLUT[idx] + alpha*(expLUT[idx + 1] - expLUT[idx]));
+
+                    float *srcPix = reinterpret_cast<float*>(srcCenterPixPtr + spaceOfs[k]);
+                    for (int cn = 0; cn < SrcVec::channels; cn++)
+                        srcSum[cn] += weight*srcPix[cn];
+                    wSum += weight;
+                }
+
+                dst.at<SrcVec>(i - radius, j - radius) = srcSum / wSum;
+            }
+        }
+    }
+};
+
+void jointBilateralFilter_32f(Mat& joint, Mat& src, Mat& dst, int radius, double sigmaColor, double sigmaSpace, int borderType)
+{
+    CV_DbgAssert(joint.depth() == CV_32F && src.depth() == CV_32F);
+
+    int d = 2*radius + 1;
+    int jCn = joint.channels();
+    const int kExpNumBinsPerChannel = 1 << 12;
+    double minValJoint, maxValJoint;
+
+    minMaxLoc(joint, &minValJoint, &maxValJoint);
+    if (abs(maxValJoint - minValJoint) < FLT_EPSILON)
+    {
+        //TODO: make circle pattern instead of square
+        GaussianBlur(src, dst, Size(d, d), sigmaSpace, 0, borderType);
+        return;
+    }
+    float colorRange = (float)(maxValJoint - minValJoint) * jCn;
+    colorRange = std::max(0.01f, colorRange);
+
+    int kExpNumBins = kExpNumBinsPerChannel * jCn;
+    vector<float> expLUTv(kExpNumBins + 2);
+    float *expLUT = &expLUTv[0];
+    float scaleIndex = kExpNumBins/colorRange;
+
+    double gaussColorCoeff = -0.5 / (sigmaColor*sigmaColor);
+    double gaussSpaceCoeff = -0.5 / (sigmaSpace*sigmaSpace);
+
+    for (int i = 0; i < kExpNumBins + 2; i++)
+    {
+        double val = i / scaleIndex;
+        expLUT[i] = (float) std::exp(val * val * gaussColorCoeff);
+    }
+
+    Mat jointTemp, srcTemp;
+    copyMakeBorder(joint, jointTemp, radius, radius, radius, radius, borderType);
+    copyMakeBorder(src, srcTemp, radius, radius, radius, radius, borderType);
+    size_t srcElemStep = srcTemp.step / srcTemp.elemSize();
+    size_t jElemStep = jointTemp.step / jointTemp.elemSize();
+    CV_Assert(srcElemStep == jElemStep);
+
+    vector<float> spaceWeightsv(d*d);
+    vector<int> spaceOfsJointv(d*d);
+    float *spaceWeights = &spaceWeightsv[0];
+    int *spaceOfsJoint = &spaceOfsJointv[0];
+
+    int maxk = 0;
+    for (int i = -radius; i <= radius; i++)
+    {
+        for (int j = -radius; j <= radius; j++)
+        {
+            double r2 = i*i + j*j;
+            if (r2 > SQR(radius))
+                continue;
+
+            spaceWeights[maxk] = (float) std::exp(r2 * gaussSpaceCoeff);
+            spaceOfsJoint[maxk] = (int) (i*jElemStep + j);
+            maxk++;
+        }
+    }
+
+    Range range(0, joint.rows);
+    if (joint.type() == CV_32FC1)
+    {
+        if (src.type() == CV_32FC1)
+        {
+            parallel_for_(range, JointBilateralFilter_32f<Vec1f, Vec1f>(jointTemp, srcTemp, dst, radius, maxk, scaleIndex, spaceOfsJoint, spaceWeights, expLUT));
+        }
+        if (src.type() == CV_32FC3)
+        {
+            parallel_for_(range, JointBilateralFilter_32f<Vec1f, Vec3f>(jointTemp, srcTemp, dst, radius, maxk, scaleIndex, spaceOfsJoint, spaceWeights, expLUT));
+        }
+    }
+
+    if (joint.type() == CV_32FC3)
+    {
+        if (src.type() == CV_32FC1)
+        {
+            parallel_for_(range, JointBilateralFilter_32f<Vec3f, Vec1f>(jointTemp, srcTemp, dst, radius, maxk, scaleIndex, spaceOfsJoint, spaceWeights, expLUT));
+        }
+        if (src.type() == CV_32FC3)
+        {
+            parallel_for_(range, JointBilateralFilter_32f<Vec3f, Vec3f>(jointTemp, srcTemp, dst, radius, maxk, scaleIndex, spaceOfsJoint, spaceWeights, expLUT));
+        }
+    }
+}
+
+template<typename JointVec, typename SrcVec>
+class JointBilateralFilter_8u : public ParallelLoopBody
+{
+    Mat &joint, &src;
+    Mat &dst;
+    int radius, maxk;
+    float scaleIndex;
+    int *spaceOfs;
+    float *spaceWeights, *expLUT;
+
+public:
+
+    JointBilateralFilter_8u(Mat& joint_, Mat& src_, Mat& dst_, int radius_,
+        int maxk_, int *spaceOfs_, float *spaceWeights_, float *expLUT_)
+        :
+        joint(joint_), src(src_), dst(dst_), radius(radius_), maxk(maxk_),
+        spaceOfs(spaceOfs_), spaceWeights(spaceWeights_), expLUT(expLUT_)
+    {
+        CV_DbgAssert(joint.type() == traits::Type<JointVec>::value && src.type() == dst.type() && src.type() == traits::Type<SrcVec>::value);
+        CV_DbgAssert(joint.rows == src.rows && src.rows == dst.rows + 2 * radius);
+        CV_DbgAssert(joint.cols == src.cols && src.cols == dst.cols + 2 * radius);
+    }
+
+    void operator () (const Range& range) const CV_OVERRIDE
+    {
+        typedef Vec<int, JointVec::channels> JointVeci;
+        typedef Vec<float, SrcVec::channels> SrcVecf;
+
+        for (int i = radius + range.start; i < radius + range.end; i++)
+        {
+            for (int j = radius; j < src.cols - radius; j++)
+            {
+                JointVec *jointCenterPixPtr = joint.ptr<JointVec>(i) + j;
+                SrcVec *srcCenterPixPtr = src.ptr<SrcVec>(i) + j;
+
+                JointVeci jointPix0 = JointVeci(*jointCenterPixPtr);
+                SrcVecf srcSum = SrcVecf::all(0.0f);
+                float wSum = 0.0f;
+
+                for (int k = 0; k < maxk; k++)
+                {
+                    uchar *jointPix = reinterpret_cast<uchar*>(jointCenterPixPtr + spaceOfs[k]);
+                    int alpha = 0;
+                    for (int cn = 0; cn < JointVec::channels; cn++)
+                        alpha += std::abs(jointPix0[cn] - (int)jointPix[cn]);
+
+                    float weight = spaceWeights[k] * expLUT[alpha];
+
+                    uchar *srcPix = reinterpret_cast<uchar*>(srcCenterPixPtr + spaceOfs[k]);
+                    for (int cn = 0; cn < SrcVec::channels; cn++)
+                        srcSum[cn] += weight*srcPix[cn];
+                    wSum += weight;
+                }
+
+                dst.at<SrcVec>(i - radius, j - radius) = SrcVec(srcSum / wSum);
+            }
+        }
+    }
+};
+
+void jointBilateralFilter_8u(Mat& joint, Mat& src, Mat& dst, int radius, double sigmaColor, double sigmaSpace, int borderType)
+{
+    CV_DbgAssert(joint.depth() == CV_8U && src.depth() == CV_8U);
+
+    int d = 2 * radius + 1;
+    int jCn = joint.channels();
+
+    double gaussColorCoeff = -0.5 / (sigmaColor*sigmaColor);
+    double gaussSpaceCoeff = -0.5 / (sigmaSpace*sigmaSpace);
+
+    vector<float> expLUTv(jCn*256);
+    float *expLUT = &expLUTv[0];
+
+    for (int i = 0; i < (int)expLUTv.size(); i++)
+    {
+        expLUT[i] = (float)std::exp(i * i * gaussColorCoeff);
+    }
+
+    Mat jointTemp, srcTemp;
+    copyMakeBorder(joint, jointTemp, radius, radius, radius, radius, borderType);
+    copyMakeBorder(src, srcTemp, radius, radius, radius, radius, borderType);
+    size_t srcElemStep = srcTemp.step / srcTemp.elemSize();
+    size_t jElemStep = jointTemp.step / jointTemp.elemSize();
+    CV_Assert(srcElemStep == jElemStep);
+
+    vector<float> spaceWeightsv(d*d);
+    vector<int> spaceOfsJointv(d*d);
+    float *spaceWeights = &spaceWeightsv[0];
+    int *spaceOfsJoint = &spaceOfsJointv[0];
+
+    int maxk = 0;
+    for (int i = -radius; i <= radius; i++)
+    {
+        for (int j = -radius; j <= radius; j++)
+        {
+            double r2 = i*i + j*j;
+            if (r2 > SQR(radius))
+                continue;
+
+            spaceWeights[maxk] = (float)std::exp(r2 * gaussSpaceCoeff);
+            spaceOfsJoint[maxk] = (int)(i*jElemStep + j);
+            maxk++;
+        }
+    }
+
+    Range range(0, src.rows);
+    if (joint.type() == CV_8UC1)
+    {
+        if (src.type() == CV_8UC1)
+        {
+            parallel_for_(range, JointBilateralFilter_8u<Vec1b, Vec1b>(jointTemp, srcTemp, dst, radius, maxk, spaceOfsJoint, spaceWeights, expLUT));
+        }
+        if (src.type() == CV_8UC3)
+        {
+            parallel_for_(range, JointBilateralFilter_8u<Vec1b, Vec3b>(jointTemp, srcTemp, dst, radius, maxk, spaceOfsJoint, spaceWeights, expLUT));
+        }
+    }
+
+    if (joint.type() == CV_8UC3)
+    {
+        if (src.type() == CV_8UC1)
+        {
+            parallel_for_(range, JointBilateralFilter_8u<Vec3b, Vec1b>(jointTemp, srcTemp, dst, radius, maxk, spaceOfsJoint, spaceWeights, expLUT));
+        }
+        if (src.type() == CV_8UC3)
+        {
+            parallel_for_(range, JointBilateralFilter_8u<Vec3b, Vec3b>(jointTemp, srcTemp, dst, radius, maxk, spaceOfsJoint, spaceWeights, expLUT));
+        }
+    }
+}
+
+void jointBilateralFilter(InputArray joint_, InputArray src_, OutputArray dst_, int d, double sigmaColor, double sigmaSpace, int borderType)
+{
+    CV_Assert(!src_.empty());
+
+    if (joint_.empty())
+    {
+        bilateralFilter(src_, dst_, d, sigmaColor, sigmaSpace, borderType);
+        return;
+    }
+
+    Mat src = src_.getMat();
+    Mat joint = joint_.getMat();
+
+    if (src.data == joint.data)
+    {
+        bilateralFilter(src_, dst_, d, sigmaColor, sigmaSpace, borderType);
+        return;
+    }
+
+    CV_Assert(src.size() == joint.size());
+    CV_Assert(src.depth() == joint.depth() && (src.depth() == CV_8U || src.depth() == CV_32F) );
+
+    if (sigmaColor <= 0)
+        sigmaColor = 1;
+    if (sigmaSpace <= 0)
+        sigmaSpace = 1;
+
+    int radius;
+    if (d <= 0)
+        radius = cvRound(sigmaSpace*1.5);
+    else
+        radius = d / 2;
+    radius = std::max(radius, 1);
+
+    dst_.create(src.size(), src.type());
+    Mat dst = dst_.getMat();
+
+    if (dst.data == joint.data)
+        joint = joint.clone();
+    if (dst.data == src.data)
+        src = src.clone();
+
+    int jointCnNum = joint.channels();
+    int srcCnNum = src.channels();
+
+    if ( (srcCnNum == 1 || srcCnNum == 3) && (jointCnNum == 1 || jointCnNum == 3) )
+    {
+        if (joint.depth() == CV_8U)
+        {
+            jointBilateralFilter_8u(joint, src, dst, radius, sigmaColor, sigmaSpace, borderType);
+        }
+        else
+        {
+            jointBilateralFilter_32f(joint, src, dst, radius, sigmaColor, sigmaSpace, borderType);
+        }
+    }
+    else
+    {
+        CV_Error(Error::BadNumChannels, "Unsupported number of channels");
+    }
+}
+
+}
+}
 
 const char* MODEL_SINET = "SINet_Softmax_simple.onnx";
 const char* MODEL_MODNET = "modnet_simple.onnx";
@@ -93,7 +496,7 @@ static obs_properties_t *filter_properties(void *data)
 	obs_property_t *p_threshold = obs_properties_add_float_slider(
 		props,
 		"threshold",
-		obs_module_text("Threshold"),
+            obs_module_text("Threshold"),
 		0.0,
 		1.0,
 		0.025);
@@ -125,7 +528,7 @@ static obs_properties_t *filter_properties(void *data)
 	obs_property_t *p_color = obs_properties_add_color(
 		props,
 		"replaceColor",
-		obs_module_text("Background Color"));
+		obs_module_text("Background color"));
 
 	obs_property_t *p_use_gpu = obs_properties_add_list(
 		props,
@@ -428,10 +831,11 @@ static void processImageForBackground(
     uint32_t inputWidth, inputHeight;
     tf->model->getNetworkInputSize(tf->inputDims, inputWidth, inputHeight);
 
+    //blog(LOG_INFO, )
     cv::Mat resizedImageRGB;
     cv::resize(imageRGB, resizedImageRGB, cv::Size(inputWidth, inputHeight));
 
-    // Prepare input to nework
+    // Prepare input to network
     cv::Mat resizedImage, preprocessedImage;
     resizedImageRGB.convertTo(resizedImage, CV_32F);
 
@@ -450,9 +854,17 @@ static void processImageForBackground(
     tf->model->postprocessOutput(outputImage);
 
     if (tf->modelSelection == MODEL_SINET || tf->modelSelection == MODEL_MEDIAPIPE) {
-      backgroundMask = outputImage > tf->threshold;
+      if (tf->threshold < 1.0f) {
+        backgroundMask = outputImage > tf->threshold;  
+      } else {
+        outputImage.convertTo(backgroundMask, CV_8UC1, 255);   
+      }        
     } else {
-      backgroundMask = outputImage < tf->threshold;
+      if (tf->threshold > 0.0f) {
+        backgroundMask = outputImage < tf->threshold;
+      } else {
+        outputImage.convertTo(backgroundMask, CV_8UC1, -255, 255);   
+      }        
     }
 
     // Contour processing
@@ -477,7 +889,7 @@ static void processImageForBackground(
     if (tf->smoothContour > 0.0) {
       int k_size = (int)(100 * tf->smoothContour);
       cv::boxFilter(backgroundMask, backgroundMask, backgroundMask.depth(), cv::Size(k_size, k_size));
-      backgroundMask = backgroundMask > 128;
+      //backgroundMask = backgroundMask > 128;
     }
   }
   catch(const std::exception& e) {
@@ -520,7 +932,7 @@ static struct obs_source_frame * filter_render(void *data, struct obs_source_fra
 			// Convert Mat to float and Normalize the alpha mask to keep intensity between 0 and 1.
 			backgroundMask.convertTo(maskFloat, CV_32FC1, 1.0 / 255.0);
 			//Feather the normalized mask.
-			cv::boxFilter(maskFloat, maskFloat, maskFloat.depth(), cv::Size(k_size, k_size));
+			//cv::boxFilter(maskFloat, maskFloat, maskFloat.depth(), cv::Size(k_size, k_size));
 
 			// Alpha blend
 			cv::Mat maskFloat3c;
@@ -537,6 +949,9 @@ static struct obs_source_frame * filter_render(void *data, struct obs_source_fra
 			// If we're not feathering/alpha blending, we can
 			// apply the mask as-is back onto the main image.
 			imageBGR.setTo(tf->backgroundColor, backgroundMask);
+			
+            //cvtColor(255 - backgroundMask, imageBGR, cv::COLOR_GRAY2BGR);
+            //cvtColor(backgroundMask, imageBGR, cv::COLOR_GRAY2BGR);
 		}
 	}
 	catch(const std::exception& e) {
@@ -559,17 +974,39 @@ static void filter_destroy(void *data)
 	}
 }
 
+/*
+static void enum_active_sources(void *data, obs_source_enum_proc_t enum_callback, void *param)
+{
+  switch (enum_callback)
+  {
+  
+  }
+}
 
+void enum_all_sources(void *data, obs_source_enum_proc_t enum_callback, void *param)
+{
+}
+
+//Called to render audio of composite sources. Only used with sources that have the OBS_SOURCE_COMPOSITE output capability flag.
+static bool audio_render(void *data, uint64_t *ts_out, struct obs_source_audio_mix *audio_output, uint32_t mixers, size_t channels, size_t sample_rate)
+{
+}
+*/
 
 struct obs_source_info background_removal_filter_info = {
 	.id = "background_removal",
 	.type = OBS_SOURCE_TYPE_FILTER,
-	.output_flags = OBS_SOURCE_VIDEO | OBS_SOURCE_ASYNC,
+	.output_flags = OBS_SOURCE_VIDEO | OBS_SOURCE_ASYNC, //| OBS_SOURCE_COMPOSITE,
 	.get_name = filter_getname,
 	.create = filter_create,
 	.destroy = filter_destroy,
 	.get_defaults = filter_defaults,
 	.get_properties = filter_properties,
 	.update = filter_update,
-	.filter_video = filter_render,
+	.filter_video = filter_render
+	/*
+	.enum_active_sources = enum_active_sources,
+	.enum_all_sources = enum_all_sources,
+	.audio_render = audio_render
+	*/
 };
